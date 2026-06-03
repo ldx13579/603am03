@@ -39,6 +39,10 @@ class NetworkManager:
         self._send_queue = queue.Queue()
         self._seq = 0
         self._lock = threading.Lock()
+        self._inflight = {}
+        self._inflight_lock = threading.Lock()
+        self._msg_timeout = 10.0
+        self._max_retries = 3
 
     @property
     def connected(self):
@@ -47,6 +51,7 @@ class NetworkManager:
     def start(self):
         threading.Thread(target=self._connect_loop, daemon=True).start()
         threading.Thread(target=self._send_loop, daemon=True).start()
+        threading.Thread(target=self._timeout_checker, daemon=True).start()
 
     def stop(self):
         self._stop.set()
@@ -61,8 +66,14 @@ class NetworkManager:
             self._seq += 1
             seq = self._seq
         msg = make_request(cmd, seq, data)
+        with self._inflight_lock:
+            self._inflight[seq] = {"msg": msg, "time": time.time(), "retries": 0}
         self._send_queue.put(msg)
         return seq
+
+    def ack_message(self, seq: int):
+        with self._inflight_lock:
+            self._inflight.pop(seq, None)
 
     def _connect_loop(self):
         while not self._stop.is_set():
@@ -74,6 +85,7 @@ class NetworkManager:
                 self._connected = True
                 self._reconnect_attempt = 0
                 self.status_queue.put(("connected", None))
+                self._replay_inflight()
                 self._read_loop()
             except (ConnectionError, OSError, socket.timeout):
                 pass
@@ -98,6 +110,34 @@ class NetworkManager:
             self._reconnect_attempt += 1
             self.status_queue.put(("disconnected", total_wait))
             self._stop.wait(total_wait)
+
+    def _replay_inflight(self):
+        with self._inflight_lock:
+            for seq, entry in list(self._inflight.items()):
+                entry["time"] = time.time()
+                self._send_queue.put(entry["msg"])
+
+    def _timeout_checker(self):
+        while not self._stop.is_set():
+            self._stop.wait(2.0)
+            if not self._connected:
+                continue
+            now = time.time()
+            with self._inflight_lock:
+                for seq, entry in list(self._inflight.items()):
+                    elapsed = now - entry["time"]
+                    if elapsed > self._msg_timeout:
+                        if entry["retries"] < self._max_retries:
+                            entry["retries"] += 1
+                            entry["time"] = now
+                            self._send_queue.put(entry["msg"])
+                        else:
+                            del self._inflight[seq]
+                            self.msg_queue.put({
+                                "type": "response", "seq": seq,
+                                "ok": False, "data": {},
+                                "error": "消息超时，已达最大重试次数",
+                            })
 
     def _read_loop(self):
         while not self._stop.is_set() and self._connected:
@@ -516,11 +556,26 @@ class ParkingClient(tk.Tk):
             data = msg.get("data", {})
             error = msg.get("error")
 
+            self.net.ack_message(seq)
             callback_info = self.pending_callbacks.pop(seq, None)
 
             if not ok:
                 self._log(f"[错误] {error}")
-                messagebox.showerror("操作失败", error or "未知错误")
+                if callback_info and callback_info[0] == "pay":
+                    plate = callback_info[1]
+                    ticket_id = callback_info[2] if len(callback_info) > 2 else None
+                    self._log(f"[支付失败] {plate} 车辆仍在库中")
+                    retry = messagebox.askretrycancel("支付失败",
+                                                      f"{error}\n\n车辆 {plate} 仍在库中，是否重试？")
+                    if retry and ticket_id:
+                        pay_seq = self.net.send_command(CMD_PAY, {
+                            "ticket_id": ticket_id,
+                            "method": callback_info[3] if len(callback_info) > 3 else "cash",
+                        })
+                        self.pending_callbacks[pay_seq] = ("pay", plate, ticket_id,
+                                                           callback_info[3] if len(callback_info) > 3 else "cash")
+                else:
+                    messagebox.showerror("操作失败", error or "未知错误")
                 return
 
             if callback_info:
@@ -545,11 +600,13 @@ class ParkingClient(tk.Tk):
                     dlg = RetrieveDialog(self, vehicle_info, bill, steps)
                     self.wait_window(dlg)
                     if dlg.result:
+                        method = dlg.result["method"]
                         pay_seq = self.net.send_command(CMD_PAY, {
                             "ticket_id": ticket_id,
-                            "method": dlg.result["method"],
+                            "method": method,
                         })
-                        self.pending_callbacks[pay_seq] = ("pay", bill.get("plate", ""))
+                        self.pending_callbacks[pay_seq] = ("pay", bill.get("plate", ""),
+                                                           ticket_id, method)
 
                 elif cb_type == "pay":
                     plate = callback_info[1]

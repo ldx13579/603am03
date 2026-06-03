@@ -201,22 +201,30 @@ class ClientHandler:
             if v is None:
                 self.send(make_response(seq, False, error="未找到该车辆"))
                 return
-
             now = datetime.now().timestamp()
             fee = calculate_fee(v.size, v.entry_time, now)
-            self.server.garage.remove_vehicle(ticket_id)
+            plate = v.plate
 
         time.sleep(0.5)
+        import random as _rand
+        payment_success = _rand.random() > 0.02
+
+        if not payment_success:
+            self.send(make_response(seq, False, error="支付失败，请重试"))
+            return
 
         receipt = {
             "ticket_id": ticket_id,
-            "plate": v.plate,
+            "plate": plate,
             "fee": round(fee, 2),
             "method": method,
             "payment_time": datetime.now().isoformat(),
             "transaction_id": str(uuid.uuid4())[:8].upper(),
         }
         self.send(make_response(seq, True, data={"receipt": receipt}))
+
+        with self.server.lock:
+            self.server.garage.remove_vehicle(ticket_id)
         self.server.broadcast_status()
 
     def _cmd_query_fee(self, seq, data):
@@ -298,12 +306,20 @@ class ParkingServer:
         with self.lock:
             status = self.garage.get_status()
         notify = make_notify(EVT_SPOT_UPDATE, status)
+        dead_clients = []
         with self.clients_lock:
             for c in self.clients:
+                if not c.alive:
+                    dead_clients.append(c)
+                    continue
                 try:
                     c.send(notify)
                 except Exception:
-                    pass
+                    c.alive = False
+                    dead_clients.append(c)
+            for c in dead_clients:
+                if c in self.clients:
+                    self.clients.remove(c)
 
 
 if __name__ == "__main__":
