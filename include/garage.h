@@ -13,10 +13,19 @@ typedef struct {
 void      garage_init(Garage *g);
 int       garage_count_free(const Garage *g, VehicleSize size);
 bool      garage_is_spot_available(const Garage *g, int level, int pos, VehicleSize size);
+void      garage_reserve_spot(Garage *g, int level, int pos);
+void      garage_unreserve_spot(Garage *g, int level, int pos);
 Vehicle  *garage_find_vehicle_by_ticket(Garage *g, int ticket_id);
 Vehicle  *garage_find_vehicle_at(Garage *g, int level, int position);
 int       garage_add_vehicle(Garage *g, const char *plate, VehicleSize size, int level, int pos);
 ErrorCode garage_remove_vehicle(Garage *g, int ticket_id);
 void      garage_display_status(const Garage *g);
+
+int       garage_prepare_park(Garage *g, const char *plate, VehicleSize size, int level, int pos);
+void      garage_commit_park(Garage *g, int ticket_id);
+void      garage_abort_park(Garage *g, int ticket_id);
+void      garage_prepare_retrieve(Garage *g, int ticket_id);
+void      garage_commit_retrieve(Garage *g, int ticket_id);
+void      garage_abort_retrieve(Garage *g, int ticket_id);
 
 #endif

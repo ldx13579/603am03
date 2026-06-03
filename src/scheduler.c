@@ -33,15 +33,30 @@ ErrorCode scheduler_assign_spot(const Garage *g, VehicleSize size,
     int best_pos = -1;
 
     int level_occ[NUM_LEVELS];
+    int total_occ = 0;
+    int total_cap = 0;
     for (int lv = 0; lv < NUM_LEVELS; lv++) {
         level_occ[lv] = calc_level_occupancy(g, lv);
+        total_occ += level_occ[lv];
+        total_cap += level_capacity(lv);
+    }
+
+    int avg_occ_pct = 0;
+    if (total_cap > 0) {
+        avg_occ_pct = (total_occ * 100) / total_cap;
     }
 
     for (int level = 0; level < NUM_LEVELS; level++) {
         int cap = level_capacity(level);
-        int utilization_penalty = 0;
+        int level_pct = 0;
         if (cap > 0) {
-            utilization_penalty = (level_occ[level] * UTILIZATION_WEIGHT * 10) / cap;
+            level_pct = (level_occ[level] * 100) / cap;
+        }
+
+        int deviation = level_pct - avg_occ_pct;
+        int utilization_penalty = 0;
+        if (deviation > 0) {
+            utilization_penalty = (deviation * UTILIZATION_WEIGHT) / 10;
         }
 
         for (int pos = 0; pos < SPOTS_PER_LEVEL; pos++) {

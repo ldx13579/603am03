@@ -11,6 +11,7 @@ void garage_init(Garage *g) {
             g->spots[level][pos].level = level;
             g->spots[level][pos].position = pos;
             g->spots[level][pos].occupied = false;
+            g->spots[level][pos].reserved = false;
             g->spots[level][pos].vehicle_id = -1;
 
             if (pos == 0 || pos == 4) {
@@ -28,6 +29,7 @@ int garage_count_free(const Garage *g, VehicleSize size) {
         for (int pos = 0; pos < SPOTS_PER_LEVEL; pos++) {
             if (level == 0 && pos == LIFT_COLUMN) continue;
             if (g->spots[level][pos].occupied) continue;
+            if (g->spots[level][pos].reserved) continue;
             if (size == VEHICLE_LARGE && g->spots[level][pos].capacity == SPOT_SMALL_ONLY) continue;
             count++;
         }
@@ -42,8 +44,21 @@ bool garage_is_spot_available(const Garage *g, int level, int pos, VehicleSize s
 
     const ParkingSpot *spot = &g->spots[level][pos];
     if (spot->occupied) return false;
+    if (spot->reserved) return false;
     if (size == VEHICLE_LARGE && spot->capacity == SPOT_SMALL_ONLY) return false;
     return true;
+}
+
+void garage_reserve_spot(Garage *g, int level, int pos) {
+    if (level >= 0 && level < NUM_LEVELS && pos >= 0 && pos < SPOTS_PER_LEVEL) {
+        g->spots[level][pos].reserved = true;
+    }
+}
+
+void garage_unreserve_spot(Garage *g, int level, int pos) {
+    if (level >= 0 && level < NUM_LEVELS && pos >= 0 && pos < SPOTS_PER_LEVEL) {
+        g->spots[level][pos].reserved = false;
+    }
 }
 
 Vehicle *garage_find_vehicle_by_ticket(Garage *g, int ticket_id) {
@@ -68,7 +83,14 @@ Vehicle *garage_find_vehicle_at(Garage *g, int level, int position) {
 
 int garage_add_vehicle(Garage *g, const char *plate, VehicleSize size, int level, int pos) {
     if (g->vehicle_count >= MAX_VEHICLES) return -1;
-    if (!garage_is_spot_available(g, level, pos, size)) return -1;
+
+    if (level < 0 || level >= NUM_LEVELS) return -1;
+    if (pos < 0 || pos >= SPOTS_PER_LEVEL) return -1;
+    if (level == 0 && pos == LIFT_COLUMN) return -1;
+
+    ParkingSpot *spot = &g->spots[level][pos];
+    if (spot->occupied) return -1;
+    if (size == VEHICLE_LARGE && spot->capacity == SPOT_SMALL_ONLY) return -1;
 
     Vehicle *v = &g->vehicles[g->vehicle_count];
     v->id = g->next_ticket_id++;
@@ -83,9 +105,11 @@ int garage_add_vehicle(Garage *g, const char *plate, VehicleSize size, int level
     v->is_temp_moved = false;
     v->original_level = level;
     v->original_position = pos;
+    v->state = VSTATE_PARKED;
 
-    g->spots[level][pos].occupied = true;
-    g->spots[level][pos].vehicle_id = v->id;
+    spot->occupied = true;
+    spot->reserved = false;
+    spot->vehicle_id = v->id;
     g->vehicle_count++;
 
     return v->id;
@@ -98,9 +122,101 @@ ErrorCode garage_remove_vehicle(Garage *g, int ticket_id) {
     g->spots[v->level][v->position].occupied = false;
     g->spots[v->level][v->position].vehicle_id = -1;
     v->is_parked = false;
+    v->state = VSTATE_RETRIEVED;
     v->exit_time = time(NULL);
 
     return ERR_OK;
+}
+
+/* ─── Two-phase commit: Park ─── */
+
+int garage_prepare_park(Garage *g, const char *plate, VehicleSize size, int level, int pos) {
+    if (g->vehicle_count >= MAX_VEHICLES) return -1;
+    if (level < 0 || level >= NUM_LEVELS) return -1;
+    if (pos < 0 || pos >= SPOTS_PER_LEVEL) return -1;
+    if (level == 0 && pos == LIFT_COLUMN) return -1;
+
+    ParkingSpot *spot = &g->spots[level][pos];
+    if (spot->occupied) return -1;
+    if (size == VEHICLE_LARGE && spot->capacity == SPOT_SMALL_ONLY) return -1;
+
+    Vehicle *v = &g->vehicles[g->vehicle_count];
+    v->id = g->next_ticket_id++;
+    v->size = size;
+    strncpy(v->plate, plate, sizeof(v->plate) - 1);
+    v->plate[sizeof(v->plate) - 1] = '\0';
+    v->level = level;
+    v->position = pos;
+    v->entry_time = time(NULL);
+    v->exit_time = 0;
+    v->is_parked = true;
+    v->is_temp_moved = false;
+    v->original_level = level;
+    v->original_position = pos;
+    v->state = VSTATE_PARKING_PREPARE;
+
+    spot->occupied = true;
+    spot->reserved = false;
+    spot->vehicle_id = v->id;
+    g->vehicle_count++;
+
+    return v->id;
+}
+
+void garage_commit_park(Garage *g, int ticket_id) {
+    for (int i = 0; i < g->vehicle_count; i++) {
+        if (g->vehicles[i].id == ticket_id) {
+            g->vehicles[i].state = VSTATE_PARKED;
+            return;
+        }
+    }
+}
+
+void garage_abort_park(Garage *g, int ticket_id) {
+    for (int i = 0; i < g->vehicle_count; i++) {
+        if (g->vehicles[i].id == ticket_id && g->vehicles[i].state == VSTATE_PARKING_PREPARE) {
+            Vehicle *v = &g->vehicles[i];
+            g->spots[v->level][v->position].occupied = false;
+            g->spots[v->level][v->position].vehicle_id = -1;
+            v->is_parked = false;
+            v->state = VSTATE_NONE;
+            return;
+        }
+    }
+}
+
+/* ─── Two-phase commit: Retrieve ─── */
+
+void garage_prepare_retrieve(Garage *g, int ticket_id) {
+    for (int i = 0; i < g->vehicle_count; i++) {
+        if (g->vehicles[i].id == ticket_id && g->vehicles[i].is_parked) {
+            g->vehicles[i].state = VSTATE_RETRIEVING_PREPARE;
+            return;
+        }
+    }
+}
+
+void garage_commit_retrieve(Garage *g, int ticket_id) {
+    for (int i = 0; i < g->vehicle_count; i++) {
+        if (g->vehicles[i].id == ticket_id && g->vehicles[i].state == VSTATE_RETRIEVING_PREPARE) {
+            Vehicle *v = &g->vehicles[i];
+            g->spots[v->level][v->position].occupied = false;
+            g->spots[v->level][v->position].vehicle_id = -1;
+            v->is_parked = false;
+            v->state = VSTATE_RETRIEVED;
+            v->exit_time = time(NULL);
+            return;
+        }
+    }
+}
+
+void garage_abort_retrieve(Garage *g, int ticket_id) {
+    for (int i = 0; i < g->vehicle_count; i++) {
+        if (g->vehicles[i].id == ticket_id && g->vehicles[i].state == VSTATE_RETRIEVING_PREPARE) {
+            g->vehicles[i].state = VSTATE_PARKED;
+            return;
+        }
+    }
 }
 
 void garage_display_status(const Garage *g) {

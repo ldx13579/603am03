@@ -11,6 +11,14 @@
 #include "sync.h"
 
 typedef struct {
+    Mutex spots[NUM_LEVELS][SPOTS_PER_LEVEL];
+    Mutex lift_lock;
+} SpotLockGrid;
+
+void spot_grid_init(SpotLockGrid *sg);
+void spot_grid_destroy(SpotLockGrid *sg);
+
+typedef struct {
     int    num_entrances;
     int    simulation_duration_s;
     double fault_probability;
@@ -27,8 +35,8 @@ typedef struct {
     Garage          *garage;
     Logger          *logger;
     Statistics      *stats;
-    Mutex           *level_locks;
-    Mutex           *garage_lock;
+    SpotLockGrid    *spot_grid;
+    RWLock          *garage_rwlock;
     volatile bool   *stop_flag;
     SimConfig       *config;
     EntranceConfig  *all_entrances;

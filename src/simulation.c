@@ -11,6 +11,50 @@ static const EntranceConfig default_entrances[NUM_ENTRANCES] = {
     {2, 4}
 };
 
+/* ─── Spot lock grid ─── */
+
+void spot_grid_init(SpotLockGrid *sg) {
+    for (int lv = 0; lv < NUM_LEVELS; lv++) {
+        for (int pos = 0; pos < SPOTS_PER_LEVEL; pos++) {
+            mutex_init(&sg->spots[lv][pos]);
+        }
+    }
+    mutex_init(&sg->lift_lock);
+}
+
+void spot_grid_destroy(SpotLockGrid *sg) {
+    for (int lv = 0; lv < NUM_LEVELS; lv++) {
+        for (int pos = 0; pos < SPOTS_PER_LEVEL; pos++) {
+            mutex_destroy(&sg->spots[lv][pos]);
+        }
+    }
+    mutex_destroy(&sg->lift_lock);
+}
+
+static void lock_spot_path(SpotLockGrid *sg, int level, int position) {
+    mutex_lock(&sg->lift_lock);
+    if (level > 0) {
+        mutex_lock(&sg->spots[0][LIFT_COLUMN]);
+        mutex_lock(&sg->spots[level][LIFT_COLUMN]);
+    }
+    if (position != LIFT_COLUMN) {
+        mutex_lock(&sg->spots[level][position]);
+    }
+}
+
+static void unlock_spot_path(SpotLockGrid *sg, int level, int position) {
+    if (position != LIFT_COLUMN) {
+        mutex_unlock(&sg->spots[level][position]);
+    }
+    if (level > 0) {
+        mutex_unlock(&sg->spots[level][LIFT_COLUMN]);
+        mutex_unlock(&sg->spots[0][LIFT_COLUMN]);
+    }
+    mutex_unlock(&sg->lift_lock);
+}
+
+/* ─── Utility ─── */
+
 static unsigned int thread_lcg(unsigned int *seed) {
     *seed = (*seed) * 1103515245u + 12345u;
     return (*seed >> 16) & 0x7FFF;
@@ -41,7 +85,8 @@ static int get_sim_hour(time_t start, int duration_s) {
 static Vehicle *pick_random_vehicle(Garage *g, unsigned int *seed) {
     int parked_count = 0;
     for (int i = 0; i < g->vehicle_count; i++) {
-        if (g->vehicles[i].is_parked && !g->vehicles[i].is_temp_moved) {
+        if (g->vehicles[i].is_parked && !g->vehicles[i].is_temp_moved &&
+            g->vehicles[i].state != VSTATE_RETRIEVING_PREPARE) {
             parked_count++;
         }
     }
@@ -50,7 +95,8 @@ static Vehicle *pick_random_vehicle(Garage *g, unsigned int *seed) {
     int pick = random_range(seed, 0, parked_count - 1);
     int idx = 0;
     for (int i = 0; i < g->vehicle_count; i++) {
-        if (g->vehicles[i].is_parked && !g->vehicles[i].is_temp_moved) {
+        if (g->vehicles[i].is_parked && !g->vehicles[i].is_temp_moved &&
+            g->vehicles[i].state != VSTATE_RETRIEVING_PREPARE) {
             if (idx == pick) return &g->vehicles[i];
             idx++;
         }
@@ -58,35 +104,19 @@ static Vehicle *pick_random_vehicle(Garage *g, unsigned int *seed) {
     return NULL;
 }
 
+/* ─── Movement execution with fine-grained locking ─── */
+
 typedef struct {
     bool     success;
     bool     fault_occurred;
     int      steps_executed;
 } ExecResult;
 
-static void lock_levels_for_op(Mutex *level_locks, int target_level) {
-    /* Lock order: always lock level 0 first, then target (prevents deadlock) */
-    if (target_level > 0) {
-        mutex_lock(&level_locks[0]);
-        mutex_lock(&level_locks[target_level]);
-    } else {
-        mutex_lock(&level_locks[0]);
-    }
-}
-
-static void unlock_levels_for_op(Mutex *level_locks, int target_level) {
-    if (target_level > 0) {
-        mutex_unlock(&level_locks[target_level]);
-        mutex_unlock(&level_locks[0]);
-    } else {
-        mutex_unlock(&level_locks[0]);
-    }
-}
-
-static ExecResult execute_movements(EntranceThreadArg *ctx, MovementSequence *seq, int level) {
+static ExecResult execute_movements(EntranceThreadArg *ctx, MovementSequence *seq,
+                                    int level, int position) {
     ExecResult result = {true, false, 0};
 
-    lock_levels_for_op(ctx->level_locks, level);
+    lock_spot_path(ctx->spot_grid, level, position);
 
     int sim_hour = get_sim_hour(ctx->sim_start_time, ctx->config->simulation_duration_s);
 
@@ -103,23 +133,25 @@ static ExecResult execute_movements(EntranceThreadArg *ctx, MovementSequence *se
             if (fr.final_success) {
                 stats_record_fault(ctx->stats, true);
                 logger_record(ctx->logger, LOG_FAULT, ctx->entrance_id,
-                              "入口%d: 步骤%d故障, 重试%d次后恢复",
-                              ctx->entrance_id + 1, i + 1, fr.retry_count);
+                              "入口%d: 步骤%d故障, 重试%d次(%dms退避)后恢复",
+                              ctx->entrance_id + 1, i + 1, fr.retry_count, fr.total_backoff_ms);
             } else {
                 stats_record_fault(ctx->stats, false);
                 logger_record(ctx->logger, LOG_FAULT, ctx->entrance_id,
-                              "入口%d: 步骤%d机械故障, 重试%d次失败, 操作回滚",
-                              ctx->entrance_id + 1, i + 1, fr.retry_count);
+                              "入口%d: 步骤%d机械故障, 重试%d次(%dms退避)失败, 操作回滚",
+                              ctx->entrance_id + 1, i + 1, fr.retry_count, fr.total_backoff_ms);
                 result.success = false;
-                unlock_levels_for_op(ctx->level_locks, level);
+                unlock_spot_path(ctx->spot_grid, level, position);
                 return result;
             }
         }
     }
 
-    unlock_levels_for_op(ctx->level_locks, level);
+    unlock_spot_path(ctx->spot_grid, level, position);
     return result;
 }
+
+/* ─── Entrance thread ─── */
 
 static unsigned __stdcall entrance_thread_func(void *arg) {
     EntranceThreadArg *ctx = (EntranceThreadArg *)arg;
@@ -136,14 +168,15 @@ static unsigned __stdcall entrance_thread_func(void *arg) {
 
         int sim_hour = get_sim_hour(ctx->sim_start_time, ctx->config->simulation_duration_s);
 
-        mutex_lock(ctx->garage_lock);
+        /* Read-lock to check occupancy */
+        rwlock_read_lock(ctx->garage_rwlock);
         int free_count = garage_count_free(ctx->garage, VEHICLE_SMALL);
         int parked_count = 0;
         for (int i = 0; i < ctx->garage->vehicle_count; i++) {
             if (ctx->garage->vehicles[i].is_parked && !ctx->garage->vehicles[i].is_temp_moved)
                 parked_count++;
         }
-        mutex_unlock(ctx->garage_lock);
+        rwlock_read_unlock(ctx->garage_rwlock);
 
         bool do_park;
         if (parked_count == 0) {
@@ -163,42 +196,50 @@ static unsigned __stdcall entrance_thread_func(void *arg) {
             char plate[16];
             generate_plate(&rng_seed, plate, sizeof(plate));
 
-            mutex_lock(ctx->garage_lock);
+            /* Phase 1: PREPARE — write-lock, plan, reserve and register vehicle */
+            rwlock_write_lock(ctx->garage_rwlock);
 
             SpotLocation spot;
             ErrorCode err = scheduler_assign_spot(ctx->garage, size,
                                                   ctx->entrance_id, ctx->all_entrances, &spot);
             if (err != ERR_OK) {
-                mutex_unlock(ctx->garage_lock);
+                rwlock_write_unlock(ctx->garage_rwlock);
                 continue;
             }
+
+            garage_reserve_spot(ctx->garage, spot.level, spot.position);
 
             MovementSequence seq;
             err = planner_plan_park(ctx->garage, spot, &seq);
             if (err != ERR_OK) {
-                mutex_unlock(ctx->garage_lock);
+                garage_unreserve_spot(ctx->garage, spot.level, spot.position);
+                rwlock_write_unlock(ctx->garage_rwlock);
                 continue;
             }
 
-            int ticket = garage_add_vehicle(ctx->garage, plate, size, spot.level, spot.position);
+            int ticket = garage_prepare_park(ctx->garage, plate, size, spot.level, spot.position);
             if (ticket < 0) {
-                mutex_unlock(ctx->garage_lock);
+                garage_unreserve_spot(ctx->garage, spot.level, spot.position);
+                rwlock_write_unlock(ctx->garage_rwlock);
                 continue;
             }
 
-            mutex_unlock(ctx->garage_lock);
+            rwlock_write_unlock(ctx->garage_rwlock);
 
-            ExecResult er = execute_movements(ctx, &seq, spot.level);
+            /* Physical movement with fine-grained spot lock */
+            ExecResult er = execute_movements(ctx, &seq, spot.level, spot.position);
 
-            mutex_lock(ctx->garage_lock);
+            /* Phase 2: COMMIT or ABORT */
+            rwlock_write_lock(ctx->garage_rwlock);
             if (!er.success) {
-                garage_remove_vehicle(ctx->garage, ticket);
+                garage_abort_park(ctx->garage, ticket);
                 planner_restore_all_temp(ctx->garage, ctx->logger);
-                mutex_unlock(ctx->garage_lock);
+                rwlock_write_unlock(ctx->garage_rwlock);
                 continue;
             }
+            garage_commit_park(ctx->garage, ticket);
             planner_execute_restore(ctx->garage, &seq, ctx->logger);
-            mutex_unlock(ctx->garage_lock);
+            rwlock_write_unlock(ctx->garage_rwlock);
 
             QueryPerformanceCounter(&t_end);
             double duration_ms = (double)(t_end.QuadPart - t_start.QuadPart) * 1000.0 / freq.QuadPart;
@@ -211,40 +252,48 @@ static unsigned __stdcall entrance_thread_func(void *arg) {
                           spot.level + 1, spot.position + 1);
 
         } else {
-            mutex_lock(ctx->garage_lock);
+            /* Phase 1: PREPARE — write-lock, plan, mark vehicle as retrieving */
+            rwlock_write_lock(ctx->garage_rwlock);
 
             Vehicle *v = pick_random_vehicle(ctx->garage, &rng_seed);
             if (!v) {
-                mutex_unlock(ctx->garage_lock);
+                rwlock_write_unlock(ctx->garage_rwlock);
                 continue;
             }
 
             int ticket = v->id;
             int vlevel = v->level;
+            int vpos = v->position;
             char vplate[16];
             strncpy(vplate, v->plate, sizeof(vplate) - 1);
             vplate[sizeof(vplate) - 1] = '\0';
 
+            garage_prepare_retrieve(ctx->garage, ticket);
+
             MovementSequence seq;
             ErrorCode err = planner_plan_retrieve(ctx->garage, ticket, &seq);
             if (err != ERR_OK) {
-                mutex_unlock(ctx->garage_lock);
+                garage_abort_retrieve(ctx->garage, ticket);
+                rwlock_write_unlock(ctx->garage_rwlock);
                 continue;
             }
 
-            mutex_unlock(ctx->garage_lock);
+            rwlock_write_unlock(ctx->garage_rwlock);
 
-            ExecResult er = execute_movements(ctx, &seq, vlevel);
+            /* Physical movement with fine-grained spot lock */
+            ExecResult er = execute_movements(ctx, &seq, vlevel, vpos);
 
-            mutex_lock(ctx->garage_lock);
+            /* Phase 2: COMMIT or ABORT */
+            rwlock_write_lock(ctx->garage_rwlock);
             if (!er.success) {
+                garage_abort_retrieve(ctx->garage, ticket);
                 planner_restore_all_temp(ctx->garage, ctx->logger);
-                mutex_unlock(ctx->garage_lock);
+                rwlock_write_unlock(ctx->garage_rwlock);
                 continue;
             }
-            garage_remove_vehicle(ctx->garage, ticket);
+            garage_commit_retrieve(ctx->garage, ticket);
             planner_execute_restore(ctx->garage, &seq, ctx->logger);
-            mutex_unlock(ctx->garage_lock);
+            rwlock_write_unlock(ctx->garage_rwlock);
 
             QueryPerformanceCounter(&t_end);
             double duration_ms = (double)(t_end.QuadPart - t_start.QuadPart) * 1000.0 / freq.QuadPart;
@@ -258,6 +307,8 @@ static unsigned __stdcall entrance_thread_func(void *arg) {
     printf("[入口%d] 线程结束\n", ctx->entrance_id + 1);
     return 0;
 }
+
+/* ─── Configuration ─── */
 
 void sim_config_default(SimConfig *cfg) {
     cfg->num_entrances = NUM_ENTRANCES;
@@ -279,6 +330,8 @@ void sim_print_config(const SimConfig *cfg) {
     printf("======================================\n\n");
 }
 
+/* ─── Main simulation loop ─── */
+
 void sim_run(SimConfig *cfg) {
     printf("\n");
     printf("╔══════════════════════════════════════════════╗\n");
@@ -296,13 +349,11 @@ void sim_run(SimConfig *cfg) {
     Statistics stats;
     stats_init(&stats);
 
-    Mutex garage_lock;
-    mutex_init(&garage_lock);
+    RWLock garage_rwlock;
+    rwlock_init(&garage_rwlock);
 
-    Mutex level_locks[NUM_LEVELS];
-    for (int i = 0; i < NUM_LEVELS; i++) {
-        mutex_init(&level_locks[i]);
-    }
+    SpotLockGrid spot_grid;
+    spot_grid_init(&spot_grid);
 
     volatile bool stop_flag = false;
     time_t sim_start = time(NULL);
@@ -321,8 +372,8 @@ void sim_run(SimConfig *cfg) {
         thread_args[i].garage = &garage;
         thread_args[i].logger = &logger;
         thread_args[i].stats = &stats;
-        thread_args[i].level_locks = level_locks;
-        thread_args[i].garage_lock = &garage_lock;
+        thread_args[i].spot_grid = &spot_grid;
+        thread_args[i].garage_rwlock = &garage_rwlock;
         thread_args[i].stop_flag = &stop_flag;
         thread_args[i].config = cfg;
         thread_args[i].all_entrances = entrances;
@@ -353,10 +404,7 @@ void sim_run(SimConfig *cfg) {
 
     stats_print_summary(&stats);
 
-    mutex_destroy(&garage_lock);
-    for (int i = 0; i < NUM_LEVELS; i++) {
-        mutex_destroy(&level_locks[i]);
-    }
+    spot_grid_destroy(&spot_grid);
     stats_destroy(&stats);
     logger_destroy(&logger);
 }

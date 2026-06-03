@@ -16,6 +16,26 @@ void mutex_unlock(Mutex *m) {
     LeaveCriticalSection(m);
 }
 
+void rwlock_init(RWLock *rw) {
+    InitializeSRWLock(rw);
+}
+
+void rwlock_read_lock(RWLock *rw) {
+    AcquireSRWLockShared(rw);
+}
+
+void rwlock_read_unlock(RWLock *rw) {
+    ReleaseSRWLockShared(rw);
+}
+
+void rwlock_write_lock(RWLock *rw) {
+    AcquireSRWLockExclusive(rw);
+}
+
+void rwlock_write_unlock(RWLock *rw) {
+    ReleaseSRWLockExclusive(rw);
+}
+
 void cond_init(CondVar *cv) {
     InitializeConditionVariable(cv);
 }

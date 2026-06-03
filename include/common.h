@@ -59,18 +59,27 @@ typedef struct {
     int          count;
 } MovementSequence;
 
+typedef enum {
+    VSTATE_NONE = 0,
+    VSTATE_PARKING_PREPARE,
+    VSTATE_PARKED,
+    VSTATE_RETRIEVING_PREPARE,
+    VSTATE_RETRIEVED
+} VehicleState;
+
 typedef struct {
-    int         id;
-    VehicleSize size;
-    char        plate[16];
-    int         level;
-    int         position;
-    time_t      entry_time;
-    time_t      exit_time;
-    bool        is_parked;
-    bool        is_temp_moved;
-    int         original_level;
-    int         original_position;
+    int          id;
+    VehicleSize  size;
+    char         plate[16];
+    int          level;
+    int          position;
+    time_t       entry_time;
+    time_t       exit_time;
+    bool         is_parked;
+    bool         is_temp_moved;
+    int          original_level;
+    int          original_position;
+    VehicleState state;
 } Vehicle;
 
 typedef struct {
@@ -78,6 +87,7 @@ typedef struct {
     int          position;
     SpotCapacity capacity;
     bool         occupied;
+    bool         reserved;
     int          vehicle_id;
 } ParkingSpot;
 
