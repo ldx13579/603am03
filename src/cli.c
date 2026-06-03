@@ -106,25 +106,7 @@ void cli_handle_park(ParkingSystem *sys) {
                   plate, size == VEHICLE_SMALL ? "小" : "大",
                   spot.level + 1, spot.position + 1);
 
-    for (int i = 0; i < sys->garage.vehicle_count; i++) {
-        Vehicle *tv = &sys->garage.vehicles[i];
-        if (tv->is_temp_moved && tv->is_parked) {
-            int temp_pos = tv->position;
-            int orig_pos = tv->original_position;
-            int lv = tv->level;
-
-            sys->garage.spots[lv][temp_pos].occupied = false;
-            sys->garage.spots[lv][temp_pos].vehicle_id = -1;
-            sys->garage.spots[lv][orig_pos].occupied = true;
-            sys->garage.spots[lv][orig_pos].vehicle_id = tv->id;
-            tv->position = orig_pos;
-            tv->is_temp_moved = false;
-
-            logger_record(&sys->logger, LOG_MOVE, tv->id,
-                          "归位: 车牌%s 从(%d层,%d号) -> (%d层,%d号)",
-                          tv->plate, lv + 1, temp_pos + 1, lv + 1, orig_pos + 1);
-        }
-    }
+    planner_execute_restore(&sys->garage, &seq, &sys->logger);
 }
 
 void cli_handle_retrieve(ParkingSystem *sys) {
@@ -177,25 +159,7 @@ void cli_handle_retrieve(ParkingSystem *sys) {
 
     garage_remove_vehicle(&sys->garage, ticket);
 
-    for (int i = 0; i < sys->garage.vehicle_count; i++) {
-        Vehicle *tv = &sys->garage.vehicles[i];
-        if (tv->is_temp_moved && tv->is_parked) {
-            int temp_pos = tv->position;
-            int orig_pos = tv->original_position;
-            int lv = tv->level;
-
-            sys->garage.spots[lv][temp_pos].occupied = false;
-            sys->garage.spots[lv][temp_pos].vehicle_id = -1;
-            sys->garage.spots[lv][orig_pos].occupied = true;
-            sys->garage.spots[lv][orig_pos].vehicle_id = tv->id;
-            tv->position = orig_pos;
-            tv->is_temp_moved = false;
-
-            logger_record(&sys->logger, LOG_MOVE, tv->id,
-                          "归位: 车牌%s 从(%d层,%d号) -> (%d层,%d号)",
-                          tv->plate, lv + 1, temp_pos + 1, lv + 1, orig_pos + 1);
-        }
-    }
+    planner_execute_restore(&sys->garage, &seq, &sys->logger);
 
     sm_handle_event(&sys->sm, EVENT_MOVE_COMPLETE, ticket);
 }

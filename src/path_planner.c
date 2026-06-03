@@ -84,25 +84,37 @@ int planner_detect_blockage(const Garage *g, int level, int position, int *block
     return count;
 }
 
-static int find_temp_spot(const Garage *g, int level, int avoid_pos) {
+ErrorCode planner_find_temp_spot(const Garage *g, int level, int avoid_pos, SpotLocation *out) {
     for (int dist = 1; dist < SPOTS_PER_LEVEL; dist++) {
         int left = avoid_pos - dist;
         int right = avoid_pos + dist;
-        if (left >= 0 && left != LIFT_COLUMN) {
-            if (!g->spots[level][left].occupied) return left;
+        if (left >= 0 && !(level == 0 && left == LIFT_COLUMN)) {
+            if (!g->spots[level][left].occupied) {
+                out->level = level;
+                out->position = left;
+                return ERR_OK;
+            }
         }
-        if (right < SPOTS_PER_LEVEL && right != LIFT_COLUMN) {
-            if (!g->spots[level][right].occupied) return right;
+        if (right < SPOTS_PER_LEVEL && !(level == 0 && right == LIFT_COLUMN)) {
+            if (!g->spots[level][right].occupied) {
+                out->level = level;
+                out->position = right;
+                return ERR_OK;
+            }
         }
     }
-    for (int level2 = 0; level2 < NUM_LEVELS; level2++) {
-        if (level2 == level) continue;
+    for (int lv = 0; lv < NUM_LEVELS; lv++) {
+        if (lv == level) continue;
         for (int p = 0; p < SPOTS_PER_LEVEL; p++) {
-            if (level2 == 0 && p == LIFT_COLUMN) continue;
-            if (!g->spots[level2][p].occupied) return p;
+            if (lv == 0 && p == LIFT_COLUMN) continue;
+            if (!g->spots[lv][p].occupied) {
+                out->level = lv;
+                out->position = p;
+                return ERR_OK;
+            }
         }
     }
-    return -1;
+    return ERR_GARAGE_FULL;
 }
 
 ErrorCode planner_resolve_blockage(Garage *g, int *blocked_ids, int count,
@@ -112,24 +124,26 @@ ErrorCode planner_resolve_blockage(Garage *g, int *blocked_ids, int count,
         Vehicle *v = garage_find_vehicle_by_ticket(g, blocked_ids[i]);
         if (!v) continue;
 
-        int temp_pos = find_temp_spot(g, v->level, v->position);
-        if (temp_pos < 0) return ERR_GARAGE_FULL;
+        SpotLocation temp;
+        ErrorCode err = planner_find_temp_spot(g, v->level, v->position, &temp);
+        if (err != ERR_OK) return ERR_GARAGE_FULL;
 
         snprintf(buf, sizeof(buf), "临时移出: 车辆[%s] 从(%d层,%d号) -> (%d层,%d号)",
-                 v->plate, v->level + 1, v->position + 1, v->level + 1, temp_pos + 1);
+                 v->plate, v->level + 1, v->position + 1, temp.level + 1, temp.position + 1);
         add_step(pre_seq, ACTION_TEMP_MOVE_OUT, blocked_ids[i], buf);
 
         snprintf(buf, sizeof(buf), "归位: 车辆[%s] 从(%d层,%d号) -> (%d层,%d号)",
-                 v->plate, v->level + 1, temp_pos + 1, v->level + 1, v->position + 1);
+                 v->plate, temp.level + 1, temp.position + 1, v->level + 1, v->position + 1);
         add_step(post_seq, ACTION_TEMP_MOVE_BACK, blocked_ids[i], buf);
 
-        int orig_pos = v->position;
+        v->original_level = v->level;
+        v->original_position = v->position;
         g->spots[v->level][v->position].occupied = false;
         g->spots[v->level][v->position].vehicle_id = -1;
-        g->spots[v->level][temp_pos].occupied = true;
-        g->spots[v->level][temp_pos].vehicle_id = v->id;
-        v->original_position = orig_pos;
-        v->position = temp_pos;
+        g->spots[temp.level][temp.position].occupied = true;
+        g->spots[temp.level][temp.position].vehicle_id = v->id;
+        v->level = temp.level;
+        v->position = temp.position;
         v->is_temp_moved = true;
     }
     return ERR_OK;
@@ -298,5 +312,64 @@ ErrorCode planner_plan_retrieve(Garage *g, int ticket_id, MovementSequence *seq)
         }
     }
 
+    return ERR_OK;
+}
+
+ErrorCode planner_execute_restore(Garage *g, const MovementSequence *seq, Logger *logger) {
+    for (int i = 0; i < seq->count; i++) {
+        const MovementStep *step = &seq->steps[i];
+        if (step->action != ACTION_TEMP_MOVE_BACK) continue;
+
+        int vehicle_id = step->param;
+        Vehicle *v = NULL;
+        for (int j = 0; j < g->vehicle_count; j++) {
+            if (g->vehicles[j].id == vehicle_id && g->vehicles[j].is_parked) {
+                v = &g->vehicles[j];
+                break;
+            }
+        }
+        if (!v || !v->is_temp_moved) continue;
+
+        int target_level = v->original_level;
+        int target_pos = v->original_position;
+        int cur_level = v->level;
+        int cur_pos = v->position;
+
+        if (g->spots[target_level][target_pos].occupied) {
+            SpotLocation alt;
+            ErrorCode err = planner_find_temp_spot(g, target_level, target_pos, &alt);
+            if (err != ERR_OK) {
+                if (logger) {
+                    logger_record(logger, LOG_ERROR, vehicle_id,
+                                  "归位失败: 车牌%s 原位(%d层,%d号)被占且无替代车位",
+                                  v->plate, target_level + 1, target_pos + 1);
+                }
+                continue;
+            }
+            if (logger) {
+                logger_record(logger, LOG_BLOCKAGE, vehicle_id,
+                              "归位重定向: 车牌%s 原位(%d层,%d号)被占, 改停(%d层,%d号)",
+                              v->plate, target_level + 1, target_pos + 1,
+                              alt.level + 1, alt.position + 1);
+            }
+            target_level = alt.level;
+            target_pos = alt.position;
+        }
+
+        g->spots[cur_level][cur_pos].occupied = false;
+        g->spots[cur_level][cur_pos].vehicle_id = -1;
+        g->spots[target_level][target_pos].occupied = true;
+        g->spots[target_level][target_pos].vehicle_id = v->id;
+        v->level = target_level;
+        v->position = target_pos;
+        v->is_temp_moved = false;
+
+        if (logger) {
+            logger_record(logger, LOG_MOVE, vehicle_id,
+                          "归位: 车牌%s 从(%d层,%d号) -> (%d层,%d号)",
+                          v->plate, cur_level + 1, cur_pos + 1,
+                          target_level + 1, target_pos + 1);
+        }
+    }
     return ERR_OK;
 }

@@ -81,6 +81,7 @@ int garage_add_vehicle(Garage *g, const char *plate, VehicleSize size, int level
     v->exit_time = 0;
     v->is_parked = true;
     v->is_temp_moved = false;
+    v->original_level = level;
     v->original_position = pos;
 
     g->spots[level][pos].occupied = true;

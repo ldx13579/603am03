@@ -63,6 +63,7 @@ typedef struct {
     time_t      exit_time;
     bool        is_parked;
     bool        is_temp_moved;
+    int         original_level;
     int         original_position;
 } Vehicle;
 
