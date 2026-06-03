@@ -79,72 +79,72 @@ class AccessHistoryTracker:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Q-learning 预摆放策略智能体（扩展状态空间）
+# Q-learning 预摆放策略智能体（精简状态空间）
 # ═══════════════════════════════════════════════════════════════════
 
 class PreMovementQLearning:
     """
     使用Q-learning学习最优预摆放策略。
 
-    扩展状态空间(State):
-      - 时段桶(6档): 0-3h, 4-7h, 8-11h, 12-15h, 16-19h, 20-23h
-      - 车位占用率(4档): <25%, 25-50%, 50-75%, >75%
-      - 热门车辆数(3档): 0, 1-2, 3+
-      - 出口层空位比(3档): 充裕(>=3), 紧张(1-2), 无空位(0)
-      - 高峰时段标志(2档): 是否处于高峰期(7-9h, 17-19h)
-      - 平均停留时长(3档): 短停(<30min), 中停(30-120min), 长停(>120min)
+    精简状态空间设计（3维度，合并相关性高的特征）:
+      - 紧迫度 urgency(4档): 合并 时段+高峰标志
+        将24h分为: 早高峰(7-9)=3, 晚高峰(17-19)=3, 平峰日间(10-16)=1, 闲时(20-6)=0
+      - 容量压力 pressure(4档): 合并 占用率+出口层空位
+        综合评分 = occupancy*0.6 + (1-exit_free/max_exit)*0.4
+      - 预移动收益 opportunity(3档): 合并 热门车数+平均停留时长
+        短停热门车收益最高(=2), 有热门但长停(=1), 无热门(=0)
 
+    总状态数: 4×4×3 = 48 (原6维: 6×4×3×3×2×3 = 1296)
     动作(Action): 0=不预移动, 1=移动1辆, 2=移动2辆, 3=移动3辆
-    奖励(Reward): 基于用户等待时间减少量、移动成本和用户满意度的综合权衡
     """
 
     NUM_ACTIONS = 4
+    MAX_EXIT_SPOTS = SPOTS_PER_LEVEL - 1  # 出口层最大可用位(除升降口)
 
-    def __init__(self, alpha: float = 0.1, gamma: float = 0.9, epsilon: float = 0.3):
+    def __init__(self, alpha: float = 0.15, gamma: float = 0.9, epsilon: float = 0.3):
         self.alpha = alpha
         self.gamma = gamma
         self.epsilon = epsilon
-        self.epsilon_decay = 0.995
+        self.epsilon_decay = 0.99
         self.epsilon_min = 0.05
-        self.q_table: Dict[Tuple, List[float]] = {}
+        self.q_table: Dict[Tuple[int, int, int], List[float]] = {}
         self.total_episodes = 0
         self.total_reward = 0.0
         self.reward_history: List[float] = []
+        self.convergence_window: List[float] = []
 
     def _get_state(self, hour: int, occupancy_pct: float, hot_count: int,
-                   exit_free: int = 2, avg_dwell_min: float = 60.0) -> Tuple:
-        hour_bucket = hour // 4
-
-        if occupancy_pct < 0.25:
-            occ_level = 0
-        elif occupancy_pct < 0.50:
-            occ_level = 1
-        elif occupancy_pct < 0.75:
-            occ_level = 2
+                   exit_free: int = 2, avg_dwell_min: float = 60.0) -> Tuple[int, int, int]:
+        if hour in (7, 8, 9, 17, 18, 19):
+            urgency = 3
+        elif 10 <= hour <= 16:
+            urgency = 1
+        elif hour in (6, 20, 21):
+            urgency = 0
         else:
-            occ_level = 3
+            urgency = 0
 
-        hot_level = min(hot_count, 2)
-
-        if exit_free >= 3:
-            exit_level = 0
-        elif exit_free >= 1:
-            exit_level = 1
+        exit_ratio = exit_free / max(1, self.MAX_EXIT_SPOTS)
+        pressure_score = occupancy_pct * 0.6 + (1.0 - exit_ratio) * 0.4
+        if pressure_score < 0.3:
+            pressure = 0
+        elif pressure_score < 0.5:
+            pressure = 1
+        elif pressure_score < 0.75:
+            pressure = 2
         else:
-            exit_level = 2
+            pressure = 3
 
-        is_peak = 1 if hour in (7, 8, 9, 17, 18, 19) else 0
-
-        if avg_dwell_min < 30:
-            dwell_level = 0
-        elif avg_dwell_min < 120:
-            dwell_level = 1
+        if hot_count == 0:
+            opportunity = 0
+        elif avg_dwell_min < 60:
+            opportunity = 2
         else:
-            dwell_level = 2
+            opportunity = 1
 
-        return (hour_bucket, occ_level, hot_level, exit_level, is_peak, dwell_level)
+        return (urgency, pressure, opportunity)
 
-    def _init_q(self, state: Tuple):
+    def _init_q(self, state: Tuple[int, int, int]):
         if state not in self.q_table:
             self.q_table[state] = [0.0] * self.NUM_ACTIONS
 
@@ -177,22 +177,30 @@ class PreMovementQLearning:
         self.total_episodes += 1
         self.total_reward += reward
         self.reward_history.append(reward)
+        self.convergence_window.append(reward)
+        if len(self.convergence_window) > 50:
+            self.convergence_window.pop(0)
 
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
+    def is_converged(self) -> bool:
+        if len(self.convergence_window) < 50:
+            return False
+        recent_mean = sum(self.convergence_window) / len(self.convergence_window)
+        variance = sum((r - recent_mean) ** 2 for r in self.convergence_window) / len(self.convergence_window)
+        return variance < 1.0
+
     def get_policy_summary(self) -> Dict[str, Any]:
         policy = {}
-        occ_labels = ["低(<25%)", "中(25-50%)", "高(50-75%)", "满(>75%)"]
-        hot_labels = ["无热门", "少量热门", "大量热门"]
-        exit_labels = ["充裕", "紧张", "无空位"]
-        peak_labels = ["非高峰", "高峰"]
-        dwell_labels = ["短停", "中停", "长停"]
+        urgency_labels = ["闲时", "平峰", "_", "高峰"]
+        pressure_labels = ["宽松", "适中", "较紧", "饱和"]
+        opportunity_labels = ["无收益", "中收益", "高收益"]
 
         for state, q_values in self.q_table.items():
             best_action = q_values.index(max(q_values))
-            hour_range = f"{state[0]*4:02d}-{state[0]*4+3:02d}h"
-            key = (f"{hour_range}|{occ_labels[state[1]]}|{hot_labels[state[2]]}|"
-                   f"出口{exit_labels[state[3]]}|{peak_labels[state[4]]}|{dwell_labels[state[5]]}")
+            key = (f"{urgency_labels[state[0]]}|"
+                   f"{pressure_labels[state[1]]}|"
+                   f"{opportunity_labels[state[2]]}")
             policy[key] = {
                 "best_action": best_action,
                 "q_values": [round(q, 3) for q in q_values],
@@ -201,14 +209,15 @@ class PreMovementQLearning:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 预移动执行器（增加多层备选位置搜索）
+# 预移动执行器（基于存取成本权重的备选位置搜索）
 # ═══════════════════════════════════════════════════════════════════
 
 class PreMovementExecutor:
-    """负责将热门车辆预移动到出口层，出口层满时尝试备选层"""
+    """负责将热门车辆预移动到高效位置，基于楼层存取成本综合评分"""
 
     MOVE_TIME_PER_LEVEL = 8.0
     MOVE_TIME_LATERAL = 3.0
+    LOAD_UNLOAD_TIME = 5.0
 
     def __init__(self):
         self.move_log: List[Dict[str, Any]] = []
@@ -224,7 +233,14 @@ class PreMovementExecutor:
     def calculate_retrieval_time(self, level: int, position: int) -> float:
         vertical = level * self.MOVE_TIME_PER_LEVEL
         horizontal = abs(position - LIFT_COLUMN) * self.MOVE_TIME_LATERAL
-        return vertical + horizontal + 5.0
+        return vertical + horizontal + self.LOAD_UNLOAD_TIME
+
+    def _spot_efficiency_score(self, level: int, pos: int) -> float:
+        """计算车位的存取效率评分(越低越好=取车越快)"""
+        retrieval = self.calculate_retrieval_time(level, pos)
+        max_retrieval = (NUM_LEVELS - 1) * self.MOVE_TIME_PER_LEVEL + \
+                        (SPOTS_PER_LEVEL - 1) * self.MOVE_TIME_LATERAL + self.LOAD_UNLOAD_TIME
+        return retrieval / max_retrieval
 
     def execute_pre_move(self, vehicles_to_move: List[Dict],
                          garage_spots: List[List[Any]]) -> List[Dict]:
@@ -234,13 +250,13 @@ class PreMovementExecutor:
             from_pos = v_info["position"]
             plate = v_info["plate"]
 
-            target = self._find_best_target(garage_spots, from_level, from_pos)
+            target = self._find_best_target_weighted(garage_spots, from_level, from_pos)
             if target is None:
                 self.failed_count += 1
                 results.append({"plate": plate, "moved": False, "reason": "所有备选位置均不可用"})
                 continue
 
-            to_level, to_pos, strategy = target
+            to_level, to_pos, strategy, score = target
             cost = self.calculate_move_cost(from_level, from_pos, to_level, to_pos)
 
             if strategy != "exit_layer":
@@ -252,6 +268,7 @@ class PreMovementExecutor:
                 "from": (from_level, from_pos),
                 "to": (to_level, to_pos),
                 "cost_seconds": round(cost, 1),
+                "efficiency_score": round(score, 3),
                 "placement_strategy": strategy,
                 "timestamp": time.time(),
             }
@@ -260,76 +277,84 @@ class PreMovementExecutor:
 
         return results
 
-    def _find_best_target(self, garage_spots, from_level: int,
-                          preferred_pos: int) -> Optional[Tuple[int, int, str]]:
-        target = self._search_layer(garage_spots, 0, preferred_pos)
-        if target:
-            return (target[0], target[1], "exit_layer")
+    def _find_best_target_weighted(self, garage_spots, from_level: int,
+                                   from_pos: int) -> Optional[Tuple[int, int, str, float]]:
+        """
+        对所有可用车位综合评分，选择最优位置。
+        评分 = 取车效率(权重0.6) + 移动成本节省(权重0.4)
+        取车效率越高(分越低)越好，移动成本越低越好。
+        """
+        candidates: List[Tuple[float, int, int, str]] = []
 
-        target = self._search_layer_near_lift(garage_spots, 1)
-        if target:
-            return (target[0], target[1], "fallback_L2_near_lift")
+        for level in range(NUM_LEVELS):
+            for pos in range(SPOTS_PER_LEVEL):
+                if level == 0 and pos == LIFT_COLUMN:
+                    continue
+                spot = garage_spots[level][pos]
+                if spot.get("occupied", False) or spot.get("reserved", False):
+                    continue
 
-        for level in range(1, NUM_LEVELS):
-            target = self._search_layer(garage_spots, level, LIFT_COLUMN)
-            if target:
-                return (target[0], target[1], f"fallback_L{level+1}")
+                efficiency = self._spot_efficiency_score(level, pos)
+                move_cost = self.calculate_move_cost(from_level, from_pos, level, pos)
+                max_move = (NUM_LEVELS - 1) * self.MOVE_TIME_PER_LEVEL + \
+                           (SPOTS_PER_LEVEL - 1) * self.MOVE_TIME_LATERAL
+                normalized_move = move_cost / max(1.0, max_move)
 
-        return None
+                combined_score = efficiency * 0.6 + normalized_move * 0.4
 
-    def _search_layer(self, garage_spots, level: int,
-                      preferred_pos: int) -> Optional[Tuple[int, int]]:
-        positions_by_distance = sorted(
-            range(SPOTS_PER_LEVEL),
-            key=lambda p: abs(p - preferred_pos)
-        )
-        for pos in positions_by_distance:
-            if level == 0 and pos == LIFT_COLUMN:
-                continue
-            spot = garage_spots[level][pos]
-            if not spot.get("occupied", False) and not spot.get("reserved", False):
-                return (level, pos)
-        return None
+                if level == 0:
+                    strategy = "exit_layer"
+                elif level == 1 and abs(pos - LIFT_COLUMN) <= 1:
+                    strategy = "near_exit"
+                else:
+                    strategy = f"fallback_L{level+1}"
 
-    def _search_layer_near_lift(self, garage_spots, level: int) -> Optional[Tuple[int, int]]:
-        candidates = sorted(
-            range(SPOTS_PER_LEVEL),
-            key=lambda p: abs(p - LIFT_COLUMN)
-        )
-        for pos in candidates:
-            if level == 0 and pos == LIFT_COLUMN:
-                continue
-            spot = garage_spots[level][pos]
-            if not spot.get("occupied", False) and not spot.get("reserved", False):
-                return (level, pos)
-        return None
+                candidates.append((combined_score, level, pos, strategy))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: x[0])
+        best = candidates[0]
+        return (best[1], best[2], best[3], best[0])
 
     def get_stats(self) -> Dict[str, Any]:
         total_moves = len(self.move_log)
         exit_moves = sum(1 for m in self.move_log if m.get("placement_strategy") == "exit_layer")
+        near_exit = sum(1 for m in self.move_log if m.get("placement_strategy") == "near_exit")
+        avg_efficiency = 0.0
+        if self.move_log:
+            scores = [m.get("efficiency_score", 0) for m in self.move_log if m.get("moved", True)]
+            avg_efficiency = sum(scores) / len(scores) if scores else 0.0
         return {
             "total_moves": total_moves,
             "exit_layer_moves": exit_moves,
+            "near_exit_moves": near_exit,
             "fallback_moves": self.fallback_count,
             "failed_moves": self.failed_count,
             "fallback_ratio": round(self.fallback_count / max(1, total_moves), 3),
+            "avg_efficiency_score": round(avg_efficiency, 3),
         }
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 用户满意度调查模拟（多维度评分）
+# 用户满意度调查模拟（动态权重调整）
 # ═══════════════════════════════════════════════════════════════════
 
 class SatisfactionSurvey:
-    """模拟用户满意度调查系统 - 多维度评价"""
+    """模拟用户满意度调查系统 - 多维度评价 + 动态权重自适应"""
 
-    DIMENSION_WEIGHTS = {
+    DIMENSIONS = ["wait_time", "smoothness", "accuracy", "safety", "environment"]
+    INITIAL_WEIGHTS = {
         "wait_time": 0.35,
         "smoothness": 0.20,
         "accuracy": 0.15,
         "safety": 0.15,
         "environment": 0.15,
     }
+    WEIGHT_ADAPT_RATE = 0.05
+    WEIGHT_MIN = 0.08
+    WEIGHT_MAX = 0.50
 
     def __init__(self):
         self.surveys: List[Dict[str, Any]] = []
@@ -337,6 +362,10 @@ class SatisfactionSurvey:
         self.dimension_history: Dict[str, Dict[str, List[float]]] = defaultdict(
             lambda: defaultdict(list)
         )
+        self.weights = dict(self.INITIAL_WEIGHTS)
+        self.weight_history: List[Dict[str, float]] = [dict(self.INITIAL_WEIGHTS)]
+        self._adapt_counter = 0
+        self._adapt_interval = 20
 
     def simulate_survey(self, wait_time: float, strategy: str = "none",
                         move_count: int = 0, fault_active: bool = False,
@@ -346,8 +375,8 @@ class SatisfactionSurvey:
         )
 
         weighted_score = sum(
-            dimensions[dim] * weight
-            for dim, weight in self.DIMENSION_WEIGHTS.items()
+            dimensions[dim] * self.weights[dim]
+            for dim in self.DIMENSIONS
         )
         weighted_score = round(max(1.0, min(5.0, weighted_score)), 1)
 
@@ -356,6 +385,7 @@ class SatisfactionSurvey:
             "wait_time_seconds": round(wait_time, 1),
             "overall_score": weighted_score,
             "dimensions": {k: round(v, 2) for k, v in dimensions.items()},
+            "weights_snapshot": {k: round(v, 3) for k, v in self.weights.items()},
             "strategy": strategy,
             "context": {
                 "is_peak": is_peak,
@@ -368,7 +398,63 @@ class SatisfactionSurvey:
         self.strategy_scores[strategy].append(weighted_score)
         for dim, score in dimensions.items():
             self.dimension_history[strategy][dim].append(score)
+
+        self._adapt_counter += 1
+        if self._adapt_counter >= self._adapt_interval:
+            self._adapt_weights()
+            self._adapt_counter = 0
+
         return survey
+
+    def _adapt_weights(self):
+        """
+        根据最近反馈动态调整维度权重。
+        原则: 用户评分低的维度对整体满意度影响更大，应提升其权重以驱动优化。
+        实现: 计算各维度近期均分，分数越低权重越上调（注意力机制思路）。
+        """
+        recent_n = min(50, len(self.surveys))
+        if recent_n < 10:
+            return
+
+        recent_surveys = self.surveys[-recent_n:]
+
+        dim_means: Dict[str, float] = {}
+        for dim in self.DIMENSIONS:
+            scores = [s["dimensions"].get(dim, 3.0) for s in recent_surveys]
+            dim_means[dim] = sum(scores) / len(scores)
+
+        overall_mean = sum(dim_means.values()) / len(dim_means)
+
+        adjustments: Dict[str, float] = {}
+        for dim in self.DIMENSIONS:
+            gap = overall_mean - dim_means[dim]
+            adjustments[dim] = gap * self.WEIGHT_ADAPT_RATE
+
+        for dim in self.DIMENSIONS:
+            self.weights[dim] += adjustments[dim]
+
+        for dim in self.DIMENSIONS:
+            self.weights[dim] = max(self.WEIGHT_MIN, min(self.WEIGHT_MAX, self.weights[dim]))
+
+        total = sum(self.weights.values())
+        for dim in self.DIMENSIONS:
+            self.weights[dim] /= total
+
+        self.weight_history.append(dict(self.weights))
+
+    def get_weight_drift(self) -> Dict[str, Any]:
+        if len(self.weight_history) < 2:
+            return {"adapted": False, "rounds": 0}
+        initial = self.weight_history[0]
+        current = self.weight_history[-1]
+        drift = {dim: round(current[dim] - initial[dim], 4) for dim in self.DIMENSIONS}
+        return {
+            "adapted": True,
+            "rounds": len(self.weight_history) - 1,
+            "initial_weights": {k: round(v, 3) for k, v in initial.items()},
+            "current_weights": {k: round(v, 3) for k, v in current.items()},
+            "drift": drift,
+        }
 
     def _score_all_dimensions(self, wait_time: float, strategy: str,
                               move_count: int, fault_active: bool,
@@ -433,6 +519,7 @@ class SatisfactionSurvey:
             "score_distribution": self._score_distribution(all_scores),
             "strategy_comparison": {},
             "dimension_analysis": {},
+            "weight_adaptation": self.get_weight_drift(),
         }
 
         for strategy, scores in self.strategy_scores.items():
@@ -473,6 +560,16 @@ class SatisfactionSurvey:
             else:
                 suggestions.append("预移动策略未能提升满意度，建议调整Q-learning参数")
 
+        weight_info = stats.get("weight_adaptation", {})
+        if weight_info.get("adapted"):
+            drift = weight_info.get("drift", {})
+            increased = [d for d, v in drift.items() if v > 0.02]
+            if increased:
+                dim_names = {"wait_time": "等待时间", "smoothness": "流畅度",
+                             "accuracy": "精度", "safety": "安全", "environment": "环境"}
+                names = [dim_names.get(d, d) for d in increased]
+                suggestions.append(f"权重自适应: {'/'.join(names)}重要性上升，系统已自动调整关注度")
+
         dim_analysis = stats.get("dimension_analysis", {})
         for strategy, dims in dim_analysis.items():
             weakest_dim = None
@@ -482,13 +579,9 @@ class SatisfactionSurvey:
                     weakest_score = data["average"]
                     weakest_dim = dim
             if weakest_dim and weakest_score < 3.5:
-                dim_names = {
-                    "wait_time": "等待时间",
-                    "smoothness": "操作流畅度",
-                    "accuracy": "定位精度",
-                    "safety": "安全感知",
-                    "environment": "环境舒适度",
-                }
+                dim_names = {"wait_time": "等待时间", "smoothness": "操作流畅度",
+                             "accuracy": "定位精度", "safety": "安全感知",
+                             "environment": "环境舒适度"}
                 label = "预移动" if strategy == "pre_move" else "无策略"
                 suggestions.append(
                     f"[{label}]最弱维度: {dim_names.get(weakest_dim, weakest_dim)}"
@@ -1029,8 +1122,10 @@ class SimulationEngine:
             )
 
         avg_reward = self.q_agent.total_reward / max(1, self.q_agent.total_episodes)
+        converged = self.q_agent.is_converged()
         print(f"  训练完成, 平均奖励: {avg_reward:.2f}, epsilon: {self.q_agent.epsilon:.3f}")
-        print(f"  Q表规模: {len(self.q_agent.q_table)} 个状态")
+        print(f"  Q表规模: {len(self.q_agent.q_table)} 个状态 (理论上限48)")
+        print(f"  收敛状态: {'已收敛' if converged else '未收敛'}")
 
     def _generate_report(self) -> Dict[str, Any]:
         avg_no = sum(self.results_no_strategy) / len(self.results_no_strategy) if self.results_no_strategy else 0
@@ -1047,6 +1142,8 @@ class SimulationEngine:
                 "sim_hours": self.sim_hours,
                 "q_learning_episodes": self.q_agent.total_episodes,
                 "state_space_size": len(self.q_agent.q_table),
+                "state_space_max": 48,
+                "converged": self.q_agent.is_converged(),
                 "vehicle_profiles": {
                     k: {"ratio": v["ratio"], "daily_freq": v["daily_freq"]}
                     for k, v in self.VEHICLE_PROFILES.items()
@@ -1083,6 +1180,7 @@ class SimulationEngine:
         b = report["baseline_no_strategy"]
         w = report["with_pre_movement"]
         imp = report["improvement"]
+        params = report["simulation_params"]
 
         print(f"\n┌─────────────────────────────────────────────────┐")
         print(f"│  策略对比结果                                    │")
@@ -1105,19 +1203,20 @@ class SimulationEngine:
         ex_stats = w.get("executor_stats", {})
         if ex_stats:
             print(f"\n┌─────────────────────────────────────────────────┐")
-            print(f"│  预移动执行统计                                  │")
+            print(f"│  预移动执行统计(成本加权选位)                    │")
             print(f"├─────────────────────────────────────────────────┤")
             print(f"│  总移动次数:     {ex_stats['total_moves']:>6d}                     │")
             print(f"│  出口层直接放置: {ex_stats['exit_layer_moves']:>6d}                     │")
-            print(f"│  备选位置放置:   {ex_stats['fallback_moves']:>6d}                     │")
+            print(f"│  近出口备选:     {ex_stats.get('near_exit_moves', 0):>6d}                     │")
+            print(f"│  远端备选放置:   {ex_stats['fallback_moves']:>6d}                     │")
             print(f"│  放置失败次数:   {ex_stats['failed_moves']:>6d}                     │")
-            print(f"│  备选比例:       {ex_stats['fallback_ratio']*100:>6.1f}%                    │")
+            print(f"│  平均效率评分:   {ex_stats.get('avg_efficiency_score', 0):>6.3f} (越低越好)     │")
             print(f"└─────────────────────────────────────────────────┘")
 
         survey = report["satisfaction_survey"]
         if survey.get("strategy_comparison"):
             print(f"\n┌─────────────────────────────────────────────────┐")
-            print(f"│  用户满意度对比(多维度加权)                      │")
+            print(f"│  用户满意度(动态权重自适应)                      │")
             print(f"├─────────────────────────────────────────────────┤")
             for strategy, data in survey["strategy_comparison"].items():
                 label = "预移动" if strategy == "pre_move" else "无策略"
@@ -1125,7 +1224,7 @@ class SimulationEngine:
                       f"(σ={data['std_dev']:.2f}, n={data['count']})")
             print(f"├─────────────────────────────────────────────────┤")
 
-            dim_names = {"wait_time": "等待时间", "smoothness": "流畅度",
+            dim_names = {"wait_time": "等待", "smoothness": "流畅",
                          "accuracy": "精度", "safety": "安全", "environment": "环境"}
             dim_analysis = survey.get("dimension_analysis", {})
             for strategy, dims in dim_analysis.items():
@@ -1134,17 +1233,31 @@ class SimulationEngine:
                             for d, s in dims.items()]
                 print(f"│  [{label}] {', '.join(dim_strs)}")
 
+            weight_info = survey.get("weight_adaptation", {})
+            if weight_info.get("adapted"):
+                print(f"├─────────────────────────────────────────────────┤")
+                print(f"│  权重自适应 ({weight_info['rounds']}轮调整)")
+                curr = weight_info.get("current_weights", {})
+                w_strs = [f"{dim_names.get(d,d)}:{v:.0%}" for d, v in curr.items()]
+                print(f"│  当前权重: {', '.join(w_strs)}")
+                drift = weight_info.get("drift", {})
+                drift_strs = [f"{dim_names.get(d,d)}:{v:+.1%}" for d, v in drift.items() if abs(v) > 0.005]
+                if drift_strs:
+                    print(f"│  漂移: {', '.join(drift_strs)}")
+
             print(f"├─────────────────────────────────────────────────┤")
-            print(f"│  建议: {report['optimization_suggestion'][:42]}")
-            if len(report['optimization_suggestion']) > 42:
-                print(f"│        {report['optimization_suggestion'][42:]}")
+            suggestion = report['optimization_suggestion']
+            while suggestion:
+                chunk = suggestion[:44]
+                suggestion = suggestion[44:]
+                print(f"│  {chunk}")
             print(f"└─────────────────────────────────────────────────┘")
 
-        print(f"\n[Q-learning] 状态空间: {report['simulation_params']['state_space_size']} 个状态")
+        print(f"\n[Q-learning] 状态空间: {params['state_space_size']}/{params['state_space_max']} "
+              f"({'已收敛' if params['converged'] else '训练中'})")
         print(f"[Q-learning策略样本]")
         for state_desc, info in list(report["q_learning_policy_sample"].items())[:6]:
-            print(f"  {state_desc}")
-            print(f"    → 预移动{info['best_action']}辆 (Q={info['q_values']})")
+            print(f"  {state_desc} → 预移动{info['best_action']}辆 Q={info['q_values']}")
 
 
 # ═══════════════════════════════════════════════════════════════════
