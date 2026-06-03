@@ -5,11 +5,6 @@
 #include "garage.h"
 #include "logger.h"
 
-typedef struct {
-    int level;
-    int position;
-} SpotLocation;
-
 ErrorCode planner_find_temp_spot(const Garage *g, int level, int avoid_pos, SpotLocation *out);
 ErrorCode planner_assign_spot(const Garage *g, VehicleSize size, SpotLocation *out);
 ErrorCode planner_plan_park(Garage *g, SpotLocation target, MovementSequence *seq);

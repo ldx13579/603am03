@@ -5,6 +5,27 @@
 
 void logger_init(Logger *log) {
     memset(log, 0, sizeof(Logger));
+#ifdef USE_THREADING
+    log->threadsafe = false;
+#endif
+}
+
+void logger_init_threadsafe(Logger *log) {
+    memset(log, 0, sizeof(Logger));
+#ifdef USE_THREADING
+    mutex_init(&log->lock);
+    log->threadsafe = true;
+#endif
+}
+
+void logger_destroy(Logger *log) {
+#ifdef USE_THREADING
+    if (log->threadsafe) {
+        mutex_destroy(&log->lock);
+    }
+#else
+    (void)log;
+#endif
 }
 
 const char *logger_type_name(LogType type) {
@@ -15,11 +36,16 @@ const char *logger_type_name(LogType type) {
     case LOG_BLOCKAGE: return "阻塞";
     case LOG_BILLING:  return "计费";
     case LOG_ERROR:    return "错误";
+    case LOG_FAULT:    return "故障";
     default:           return "未知";
     }
 }
 
 void logger_record(Logger *log, LogType type, int vehicle_id, const char *fmt, ...) {
+#ifdef USE_THREADING
+    if (log->threadsafe) mutex_lock(&log->lock);
+#endif
+
     LogEntry *entry = &log->entries[log->write_index];
     entry->type = type;
     entry->timestamp = time(NULL);
@@ -34,6 +60,10 @@ void logger_record(Logger *log, LogType type, int vehicle_id, const char *fmt, .
     if (log->count < MAX_LOG_ENTRIES) {
         log->count++;
     }
+
+#ifdef USE_THREADING
+    if (log->threadsafe) mutex_unlock(&log->lock);
+#endif
 }
 
 void logger_display(const Logger *log, int last_n) {

@@ -5,12 +5,13 @@
 #include <stdbool.h>
 #include <time.h>
 
-#define NUM_LEVELS      3
-#define SPOTS_PER_LEVEL 5
-#define TOTAL_SPOTS     (NUM_LEVELS * SPOTS_PER_LEVEL)
-#define MAX_VEHICLES    TOTAL_SPOTS
-#define MAX_LOG_ENTRIES 256
-#define LIFT_COLUMN     2
+#define NUM_LEVELS        3
+#define SPOTS_PER_LEVEL   5
+#define TOTAL_SPOTS       (NUM_LEVELS * SPOTS_PER_LEVEL)
+#define MAX_VEHICLES      TOTAL_SPOTS
+#define MAX_LOG_ENTRIES   256
+#define LIFT_COLUMN       2
+#define MOVEMENT_STEP_MS  200
 
 typedef enum {
     VEHICLE_SMALL = 0,
@@ -45,6 +46,11 @@ typedef struct {
     int        param;
     char       description[128];
 } MovementStep;
+
+typedef struct {
+    int level;
+    int position;
+} SpotLocation;
 
 #define MAX_STEPS 32
 
@@ -81,7 +87,8 @@ typedef enum {
     LOG_MOVE,
     LOG_BLOCKAGE,
     LOG_BILLING,
-    LOG_ERROR
+    LOG_ERROR,
+    LOG_FAULT
 } LogType;
 
 typedef struct {
@@ -98,7 +105,8 @@ typedef enum {
     ERR_VEHICLE_NOT_FOUND,
     ERR_INVALID_INPUT,
     ERR_STATE_CONFLICT,
-    ERR_PATH_BLOCKED
+    ERR_PATH_BLOCKED,
+    ERR_MECHANICAL_FAULT
 } ErrorCode;
 
 #endif
