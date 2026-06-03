@@ -11,6 +11,7 @@ import threading
 import queue
 import time
 import random
+import uuid
 from datetime import datetime
 
 from config import (
@@ -67,7 +68,8 @@ class NetworkManager:
             seq = self._seq
         msg = make_request(cmd, seq, data)
         with self._inflight_lock:
-            self._inflight[seq] = {"msg": msg, "time": time.time(), "retries": 0}
+            self._inflight[seq] = {"msg": msg, "time": time.time(), "retries": 0,
+                                   "base_timeout": self._msg_timeout}
         self._send_queue.put(msg)
         return seq
 
@@ -125,8 +127,9 @@ class NetworkManager:
             now = time.time()
             with self._inflight_lock:
                 for seq, entry in list(self._inflight.items()):
+                    timeout = entry["base_timeout"] * (2 ** entry["retries"])
                     elapsed = now - entry["time"]
-                    if elapsed > self._msg_timeout:
+                    if elapsed > timeout:
                         if entry["retries"] < self._max_retries:
                             entry["retries"] += 1
                             entry["time"] = now
@@ -564,16 +567,19 @@ class ParkingClient(tk.Tk):
                 if callback_info and callback_info[0] == "pay":
                     plate = callback_info[1]
                     ticket_id = callback_info[2] if len(callback_info) > 2 else None
+                    method = callback_info[3] if len(callback_info) > 3 else "cash"
+                    idem_key = callback_info[4] if len(callback_info) > 4 else str(uuid.uuid4())
                     self._log(f"[支付失败] {plate} 车辆仍在库中")
                     retry = messagebox.askretrycancel("支付失败",
                                                       f"{error}\n\n车辆 {plate} 仍在库中，是否重试？")
                     if retry and ticket_id:
                         pay_seq = self.net.send_command(CMD_PAY, {
                             "ticket_id": ticket_id,
-                            "method": callback_info[3] if len(callback_info) > 3 else "cash",
+                            "method": method,
+                            "idempotency_key": idem_key,
                         })
                         self.pending_callbacks[pay_seq] = ("pay", plate, ticket_id,
-                                                           callback_info[3] if len(callback_info) > 3 else "cash")
+                                                           method, idem_key)
                 else:
                     messagebox.showerror("操作失败", error or "未知错误")
                 return
@@ -601,12 +607,14 @@ class ParkingClient(tk.Tk):
                     self.wait_window(dlg)
                     if dlg.result:
                         method = dlg.result["method"]
+                        idem_key = str(uuid.uuid4())
                         pay_seq = self.net.send_command(CMD_PAY, {
                             "ticket_id": ticket_id,
                             "method": method,
+                            "idempotency_key": idem_key,
                         })
                         self.pending_callbacks[pay_seq] = ("pay", bill.get("plate", ""),
-                                                           ticket_id, method)
+                                                           ticket_id, method, idem_key)
 
                 elif cb_type == "pay":
                     plate = callback_info[1]

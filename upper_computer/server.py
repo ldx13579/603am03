@@ -8,8 +8,10 @@ import socket
 import threading
 import time
 import uuid
+import random as _rand
 from datetime import datetime
-from typing import List
+from typing import List, Dict, Any, Tuple
+from collections import OrderedDict
 
 from config import SERVER_HOST, SERVER_PORT
 from models import Garage, VehicleSize, VehicleState
@@ -57,6 +59,15 @@ class ClientHandler:
         cmd = msg.get("cmd", "")
         seq = msg.get("seq", 0)
         data = msg.get("data", {})
+        idempotency_key = data.get("idempotency_key")
+
+        if idempotency_key:
+            cached = self.server.get_cached_response(idempotency_key)
+            if cached is not None:
+                cached_resp = cached.copy()
+                cached_resp["seq"] = seq
+                self.send(cached_resp)
+                return
 
         handler_map = {
             CMD_STATUS: self._cmd_status,
@@ -195,6 +206,7 @@ class ClientHandler:
     def _cmd_pay(self, seq, data):
         ticket_id = data.get("ticket_id", -1)
         method = data.get("method", "cash")
+        idempotency_key = data.get("idempotency_key")
 
         with self.server.lock:
             v = self.server.garage.find_vehicle_by_ticket(ticket_id)
@@ -206,7 +218,6 @@ class ClientHandler:
             plate = v.plate
 
         time.sleep(0.5)
-        import random as _rand
         payment_success = _rand.random() > 0.02
 
         if not payment_success:
@@ -221,7 +232,11 @@ class ClientHandler:
             "payment_time": datetime.now().isoformat(),
             "transaction_id": str(uuid.uuid4())[:8].upper(),
         }
-        self.send(make_response(seq, True, data={"receipt": receipt}))
+        resp = make_response(seq, True, data={"receipt": receipt})
+        self.send(resp)
+
+        if idempotency_key:
+            self.server.cache_response(idempotency_key, resp)
 
         with self.server.lock:
             self.server.garage.remove_vehicle(ticket_id)
@@ -253,6 +268,8 @@ class ClientHandler:
 
 
 class ParkingServer:
+    DEDUP_CACHE_MAX = 256
+
     def __init__(self, host: str = SERVER_HOST, port: int = SERVER_PORT):
         self.host = host
         self.port = port
@@ -261,6 +278,18 @@ class ParkingServer:
         self.clients: List[ClientHandler] = []
         self.clients_lock = threading.Lock()
         self.running = False
+        self._dedup_cache: OrderedDict = OrderedDict()
+        self._dedup_lock = threading.Lock()
+
+    def cache_response(self, idempotency_key: str, response: Dict[str, Any]):
+        with self._dedup_lock:
+            self._dedup_cache[idempotency_key] = response
+            while len(self._dedup_cache) > self.DEDUP_CACHE_MAX:
+                self._dedup_cache.popitem(last=False)
+
+    def get_cached_response(self, idempotency_key: str) -> Any:
+        with self._dedup_lock:
+            return self._dedup_cache.get(idempotency_key)
 
     def run(self):
         self.running = True
