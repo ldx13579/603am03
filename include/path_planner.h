@@ -12,5 +12,6 @@ ErrorCode planner_plan_retrieve(Garage *g, int ticket_id, MovementSequence *seq)
 int       planner_detect_blockage(const Garage *g, int level, int position, int *blocked_ids, int max_ids);
 ErrorCode planner_resolve_blockage(Garage *g, int *blocked_ids, int count, MovementSequence *pre_seq, MovementSequence *post_seq);
 ErrorCode planner_execute_restore(Garage *g, const MovementSequence *seq, Logger *logger);
+ErrorCode planner_restore_all_temp(Garage *g, Logger *logger);
 
 #endif

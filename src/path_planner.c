@@ -363,10 +363,63 @@ ErrorCode planner_execute_restore(Garage *g, const MovementSequence *seq, Logger
         v->level = target_level;
         v->position = target_pos;
         v->is_temp_moved = false;
+        v->original_level = target_level;
+        v->original_position = target_pos;
 
         if (logger) {
             logger_record(logger, LOG_MOVE, vehicle_id,
                           "归位: 车牌%s 从(%d层,%d号) -> (%d层,%d号)",
+                          v->plate, cur_level + 1, cur_pos + 1,
+                          target_level + 1, target_pos + 1);
+        }
+    }
+    return ERR_OK;
+}
+
+ErrorCode planner_restore_all_temp(Garage *g, Logger *logger) {
+    for (int i = 0; i < g->vehicle_count; i++) {
+        Vehicle *v = &g->vehicles[i];
+        if (!v->is_parked || !v->is_temp_moved) continue;
+
+        int target_level = v->original_level;
+        int target_pos = v->original_position;
+        int cur_level = v->level;
+        int cur_pos = v->position;
+
+        if (g->spots[target_level][target_pos].occupied &&
+            !(target_level == cur_level && target_pos == cur_pos)) {
+            SpotLocation alt;
+            ErrorCode err = planner_find_temp_spot(g, target_level, target_pos, &alt);
+            if (err != ERR_OK) {
+                if (logger) {
+                    logger_record(logger, LOG_ERROR, v->id,
+                                  "回滚归位失败: 车牌%s 原位(%d层,%d号)被占且无替代",
+                                  v->plate, target_level + 1, target_pos + 1);
+                }
+                continue;
+            }
+            if (logger) {
+                logger_record(logger, LOG_BLOCKAGE, v->id,
+                              "回滚归位重定向: 车牌%s -> (%d层,%d号)",
+                              v->plate, alt.level + 1, alt.position + 1);
+            }
+            target_level = alt.level;
+            target_pos = alt.position;
+        }
+
+        g->spots[cur_level][cur_pos].occupied = false;
+        g->spots[cur_level][cur_pos].vehicle_id = -1;
+        g->spots[target_level][target_pos].occupied = true;
+        g->spots[target_level][target_pos].vehicle_id = v->id;
+        v->level = target_level;
+        v->position = target_pos;
+        v->is_temp_moved = false;
+        v->original_level = target_level;
+        v->original_position = target_pos;
+
+        if (logger) {
+            logger_record(logger, LOG_MOVE, v->id,
+                          "回滚归位: 车牌%s 从(%d层,%d号) -> (%d层,%d号)",
                           v->plate, cur_level + 1, cur_pos + 1,
                           target_level + 1, target_pos + 1);
         }

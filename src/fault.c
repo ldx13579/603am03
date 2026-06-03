@@ -1,4 +1,5 @@
 #include "fault.h"
+#include <windows.h>
 
 static unsigned int lcg_next(unsigned int *seed) {
     *seed = (*seed) * 1103515245u + 12345u;
@@ -8,6 +9,7 @@ static unsigned int lcg_next(unsigned int *seed) {
 void fault_config_init(FaultConfig *fc, double prob, int max_retries) {
     fc->failure_probability = prob;
     fc->max_retries = max_retries;
+    fc->base_backoff_ms = FAULT_BASE_BACKOFF_MS;
     fc->enabled = (prob > 0.0);
     fc->seed = 0;
 }
@@ -24,7 +26,7 @@ bool fault_should_fail(FaultConfig *fc) {
 }
 
 FaultResult fault_execute_step(FaultConfig *fc) {
-    FaultResult result = {false, 0, true};
+    FaultResult result = {false, 0, true, 0};
 
     if (!fc->enabled) return result;
 
@@ -34,7 +36,11 @@ FaultResult fault_execute_step(FaultConfig *fc) {
     result.final_success = false;
 
     for (int retry = 0; retry < fc->max_retries; retry++) {
+        int backoff = fc->base_backoff_ms * (1 << retry);
+        Sleep(backoff);
+        result.total_backoff_ms += backoff;
         result.retry_count++;
+
         if (!fault_should_fail(fc)) {
             result.final_success = true;
             return result;

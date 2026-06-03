@@ -64,10 +64,29 @@ typedef struct {
     int      steps_executed;
 } ExecResult;
 
+static void lock_levels_for_op(Mutex *level_locks, int target_level) {
+    /* Lock order: always lock level 0 first, then target (prevents deadlock) */
+    if (target_level > 0) {
+        mutex_lock(&level_locks[0]);
+        mutex_lock(&level_locks[target_level]);
+    } else {
+        mutex_lock(&level_locks[0]);
+    }
+}
+
+static void unlock_levels_for_op(Mutex *level_locks, int target_level) {
+    if (target_level > 0) {
+        mutex_unlock(&level_locks[target_level]);
+        mutex_unlock(&level_locks[0]);
+    } else {
+        mutex_unlock(&level_locks[0]);
+    }
+}
+
 static ExecResult execute_movements(EntranceThreadArg *ctx, MovementSequence *seq, int level) {
     ExecResult result = {true, false, 0};
 
-    mutex_lock(&ctx->level_locks[level]);
+    lock_levels_for_op(ctx->level_locks, level);
 
     int sim_hour = get_sim_hour(ctx->sim_start_time, ctx->config->simulation_duration_s);
 
@@ -92,13 +111,13 @@ static ExecResult execute_movements(EntranceThreadArg *ctx, MovementSequence *se
                               "入口%d: 步骤%d机械故障, 重试%d次失败, 操作回滚",
                               ctx->entrance_id + 1, i + 1, fr.retry_count);
                 result.success = false;
-                mutex_unlock(&ctx->level_locks[level]);
+                unlock_levels_for_op(ctx->level_locks, level);
                 return result;
             }
         }
     }
 
-    mutex_unlock(&ctx->level_locks[level]);
+    unlock_levels_for_op(ctx->level_locks, level);
     return result;
 }
 
@@ -174,7 +193,7 @@ static unsigned __stdcall entrance_thread_func(void *arg) {
             mutex_lock(ctx->garage_lock);
             if (!er.success) {
                 garage_remove_vehicle(ctx->garage, ticket);
-                planner_execute_restore(ctx->garage, &seq, ctx->logger);
+                planner_restore_all_temp(ctx->garage, ctx->logger);
                 mutex_unlock(ctx->garage_lock);
                 continue;
             }
@@ -205,7 +224,6 @@ static unsigned __stdcall entrance_thread_func(void *arg) {
             char vplate[16];
             strncpy(vplate, v->plate, sizeof(vplate) - 1);
             vplate[sizeof(vplate) - 1] = '\0';
-            int vpos = v->position;
 
             MovementSequence seq;
             ErrorCode err = planner_plan_retrieve(ctx->garage, ticket, &seq);
@@ -214,27 +232,17 @@ static unsigned __stdcall entrance_thread_func(void *arg) {
                 continue;
             }
 
-            garage_remove_vehicle(ctx->garage, ticket);
             mutex_unlock(ctx->garage_lock);
 
             ExecResult er = execute_movements(ctx, &seq, vlevel);
 
             mutex_lock(ctx->garage_lock);
             if (!er.success) {
-                /* Rollback: re-mark vehicle as parked and re-occupy the spot */
-                for (int i = 0; i < ctx->garage->vehicle_count; i++) {
-                    if (ctx->garage->vehicles[i].id == ticket) {
-                        ctx->garage->vehicles[i].is_parked = true;
-                        ctx->garage->vehicles[i].exit_time = 0;
-                        ctx->garage->spots[vlevel][vpos].occupied = true;
-                        ctx->garage->spots[vlevel][vpos].vehicle_id = ticket;
-                        break;
-                    }
-                }
-                planner_execute_restore(ctx->garage, &seq, ctx->logger);
+                planner_restore_all_temp(ctx->garage, ctx->logger);
                 mutex_unlock(ctx->garage_lock);
                 continue;
             }
+            garage_remove_vehicle(ctx->garage, ticket);
             planner_execute_restore(ctx->garage, &seq, ctx->logger);
             mutex_unlock(ctx->garage_lock);
 

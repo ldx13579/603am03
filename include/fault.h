@@ -4,9 +4,12 @@
 #include "common.h"
 #include <stdbool.h>
 
+#define FAULT_BASE_BACKOFF_MS 100
+
 typedef struct {
     double       failure_probability;
     int          max_retries;
+    int          base_backoff_ms;
     bool         enabled;
     unsigned int seed;
 } FaultConfig;
@@ -15,6 +18,7 @@ typedef struct {
     bool failed;
     int  retry_count;
     bool final_success;
+    int  total_backoff_ms;
 } FaultResult;
 
 void        fault_config_init(FaultConfig *fc, double prob, int max_retries);

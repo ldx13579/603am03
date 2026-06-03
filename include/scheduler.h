@@ -4,9 +4,10 @@
 #include "common.h"
 #include "garage.h"
 
-#define NUM_ENTRANCES   3
-#define HORIZONTAL_WEIGHT 2
-#define VERTICAL_WEIGHT   5
+#define NUM_ENTRANCES       3
+#define HORIZONTAL_WEIGHT   2
+#define VERTICAL_WEIGHT     5
+#define UTILIZATION_WEIGHT  3
 
 typedef struct {
     int entrance_id;
